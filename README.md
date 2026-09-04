@@ -1,9 +1,10 @@
-# Trader — Multi-Agent Options Trading System
+# Yield-paca — Multi-Agent AI Trading System on Alpaca MCP
 
-Built for the **Alpaca AI Trading Agents Hackathon** (Aug 28 – Sep 4, 2026). A $100,000 paper account runs the full multi-agent trading pipeline against US equity options through Alpaca's MCP server. The same engine replays itself against historical data for backtesting.
+Built for the **Alpaca AI Trading Agents Hackathon** (Aug 28 – Sep 4, 2026). A paper account (ID `PA3PR2RMFE9Y`) runs **three production strategies** against US equity options through Alpaca's MCP server — two deterministic (Mid-Band Movers, Overnight Reversal) and one full multi-agent LLM pipeline (Bull/Bear-Debate-Driven Ticker Pipeline). The same engine replays itself against historical data for backtesting.
 
 ```
 Trading window: Mon Aug 31 9:30am ET → Fri Sep 4 9:30am ET
+Paper account:  PA3PR2RMFE9Y
 ```
 
 ## Architecture at a glance
@@ -19,15 +20,19 @@ flowchart LR
   end
 
   subgraph Api[Rails 8 API]
-    Controllers[9 JSON controllers]
+    Controllers[JSON controllers]
     Risk[Risk Manager]
     Portfolio[Portfolio Manager]
+    Strats[3 Strategies]
     Eng[Backtest Engine]
   end
 
   subgraph Temporal[Temporal]
     Sched[Scheduler Workflow]
     PT[Process Ticker Workflow]
+    MBM[Mid-Band Movers<br/>11:30 AM ET]
+    OVN[Overnight Reversal<br/>9:35 AM ET]
+    Close[Close Child<br/>15:55 ET / scheduled]
     Mon[Monitor Position Workflow]
     Rev[Review Position Workflow]
     BWF[Backtest Workflow]
@@ -51,6 +56,8 @@ flowchart LR
   subgraph External[External Services]
     LLM[MiniMax-M3 via OpenAI API]
     Alpaca[Alpaca MCP Server]
+    TV[TradingView MCP]
+    OF[OptionsFlow MCP]
     FRED[FRED]
     Edgar[SEC EDGAR]
   end
@@ -59,6 +66,8 @@ flowchart LR
   Controllers --> Temporal
   Temporal --> Workers
   Workers --> Agents
+  Workers --> Alpaca
+  Strats --> Risk
   Agents --> LLM
   Agents --> Alpaca
   Eng --> Agents
@@ -72,18 +81,18 @@ Five Docker services: `postgres`, `temporal`, `alpaca-mcp`, `api`, `front`.
 
 ## Tech stack
 
-| Layer            | Choice                                        |
-|------------------|-----------------------------------------------|
-| API              | Rails 8.1, Ruby 4.0.6 (YJIT), bootsnap        |
-| Database         | Postgres 18                                   |
-| Orchestration    | Temporal (Cloud for prod, containerized dev)  |
-| LLM              | MiniMax-M3 via OpenAI-compatible endpoints    |
-| LLM framework    | `ruby_llm-mcp` for tool discovery             |
-| MCP              | `alpaca-mcp` (Alpaca's official Python server) |
-| HTTP (FRED/EDGAR)| Faraday                                       |
-| Rate limiting    | Custom token bucket per source                |
-| Circuit breaker  | 3-state, per source, with back-off            |
-| Front-end        | Vue 3 + Vite + Naive UI + Pinia + ECharts     |
+| Layer             | Choice                                                                                                      |
+| ----------------- | ----------------------------------------------------------------------------------------------------------- |
+| API               | Rails 8.1, Ruby 4.0.6 (YJIT), bootsnap                                                                      |
+| Database          | Postgres 18                                                                                                 |
+| Orchestration     | Temporal (Cloud for prod, containerized dev)                                                                |
+| LLM               | MiniMax-M3 via OpenAI-compatible endpoints                                                                  |
+| LLM framework     | `ruby_llm-mcp` for tool discovery                                                                           |
+| MCP servers       | `alpaca-mcp` (orders/data), `tradingview-mcp` (screener), `optionsflow-mcp` (sentiment), `fred-mcp` (macro) |
+| HTTP (FRED/EDGAR) | Faraday                                                                                                     |
+| Rate limiting     | Custom token bucket per source                                                                              |
+| Circuit breaker   | 3-state, per source, with back-off                                                                          |
+| Front-end         | Vue 3 + Vite + Naive UI + Pinia + ECharts                                                                   |
 
 ## Repository layout
 
@@ -183,6 +192,72 @@ backtest:     default_period_days, slippage, commission, fill_model, start_of_da
 alpaca_mcp:   server URL, readonly vs trading toolsets
 ```
 
+## Strategies
+
+Three production strategies run on the same paper account, each through its own Temporal cron schedule. They share the same `Risk::RiskManager` and `Portfolio::PortfolioManager` gates, and the same `AlpacaMirror` audit loop.
+
+### 1. Mid-Band Movers — deterministic, scheduled at 11:30 AM ET
+
+```mermaid
+flowchart LR
+  Cron[11:30 AM ET] --> Run[RunMidBandMoversWorkflow]
+  Run --> BP[BuildPlanActivity]
+  BP --> M[Mid-Band Movers Strategy<br/>3 buckets 2h / 4h / 23.5h]
+  M --> Buy[SubmitBuyOrdersActivity]
+  Buy --> Sell1[SellWorkflow A]
+  Buy --> Sell2[SellWorkflow B]
+  Buy --> Sell3[SellWorkflow C]
+  Sell1 -.sleep until 13:30 ET.-> Close
+  Sell2 -.sleep until 15:30 ET.-> Close
+  Sell3 -.sleep until 11:00 ET next day.-> Close
+```
+
+- Picks yesterday's top movers, filters to optionable universe, drops the top/bottom tails (`drop_top_pct: 5`, `drop_bottom_pct: 60`)
+- Splits survivors into 3 buckets with hold-times 2h / 4h / 23.5h
+- Buys ATM 0DTE/30DTE long calls sized off `options_buying_power × total_risk_pct`
+- Each order spawns a `SellWorkflow` child that sleeps to its planned `planned_sell_at`, then submits `sell_to_close`
+- Implementation: `app/strategies/mid_band_movers/`, `app/workflows/mid_band_movers/`, `app/activities/mid_band_movers/`
+
+### 2. Overnight Reversal — deterministic, scheduled at 9:35 AM ET
+
+```mermaid
+flowchart LR
+  Cron[9:35 AM ET] --> Run[RunOvernightReversalWorkflow]
+  Run --> BP[BuildPlanActivity<br/>screener yesterday's movers]
+  BP --> Probe[Eligibility probe<br/>DTE 0/3/7/14/30/60]
+  Probe --> Plan[Plan: 10 winners + 10 losers]
+  Plan --> Submit[SubmitOrdersActivity<br/>winners = long calls<br/>losers = bear-call spreads]
+  Submit --> Children[Spawn CloseOvernightReversalWorkflow<br/>sleeps until 15:55 ET]
+  Children --> Close[ClosePositionsActivity<br/>sell_to_close + buy_to_close]
+```
+
+- Yesterday's top **winners** → ATM long calls (long bias on reversal)
+- Yesterday's top **losers** → bear-call credit spreads (defined-risk short bias, $5 width)
+- Per-name eligibility probe that walks DTE windows [0, 3, 7, 14, 30, 60] requiring broker `ask_size ≥ 5` contracts
+- `CloseOvernightReversalWorkflow` child sleeps to 15:55 ET, then flattens every `origin='overnight_reversal'` position
+- Implementation: `app/strategies/overnight_reversal/`, `app/workflows/overnight_reversal/`, `app/activities/overnight_reversal/`
+
+### 3. Bull/Bear Debate-Driven Ticker Pipeline — LLM, scheduled every 15 min
+
+This is the **full multi-agent pipeline** that runs against every watchlist ticker the TickerSelector picks each morning. (See the next section for the per-phase detail.)
+
+```
+FetchMarketState → RunAnalystPhase (4 specialists in parallel)
+  → RunDebatePhase (Bull + Bear argue; Research Manager synthesizes)
+  → RunExecutionPhase (Trader LLM designs a multi-leg structure)
+  → RiskManager (deterministic: per-leg options_approved_level check,
+                  max_position_pct, max_open_positions, decision_ttl)
+  → PortfolioManager (deterministic: re-verify, submit via MCP)
+```
+
+- **Bull Researcher** + **Bear Researcher** agents argue in parallel, each citing the same four analyst briefs and addressing each other's prior arguments
+- **Research Manager** synthesizes a typed `ResearchPlan` (direction, confidence, key catalysts, invalidation conditions)
+- **Trader** LLM designs the concrete structure (`vertical` / `iron_condor` / etc.), sized off live `options_buying_power`
+- Deterministic Risk + Portfolio gates before the broker call
+- Position review (every 30 min) re-runs the Bull/Bear pattern on open positions
+
+All three strategies flow through the same `RiskManager + PortfolioManager` stack — there's exactly one execution pipeline, three ways to source trade ideas.
+
 ## Multi-agent trading pipeline
 
 The full pipeline runs per ticker in `Trading::ProcessTickerWorkflow`, fanned out by `Trading::SchedulerWorkflow`.
@@ -217,25 +292,26 @@ flowchart TB
 
 ### 11 LLM agents + 3 deterministic services (14 total in the pipeline)
 
-| Stage        | Agent                  | Tool access                  |
-|--------------|------------------------|------------------------------|
-| Universe     | (TickerSelector)       | Alpaca assets, FRED          |
-| Analyst      | MarketDataAnalyst      | MCP read-only (chain, bars)  |
-| Analyst      | NewsAnalyst            | MCP read-only (news)         |
-| Analyst      | MacroAnalyst           | FRED (Faraday)               |
-| Analyst      | InsiderAnalyst         | EDGAR (Faraday)              |
-| Debate       | BullResearcher         | none — pure LLM              |
-| Debate       | BearResearcher         | none — pure LLM              |
-| Debate       | ResearchManager        | none — single-shot gate      |
-| Trader       | Trader                 | none — single-leg proposal   |
-| Position     | PositionReviewAgent    | none — 30-min check          |
-| Position     | AdjustmentAgent        | none — proposes new leg      |
-| TickerSel    | TickerSelector         | Alpaca assets, FRED          |
-| **Deterministic** | RiskManager       | reads `trading.yml` limits   |
-| **Deterministic** | PortfolioManager  | trading MCP (broker)         |
-| **Deterministic** | PositionMonitor   | refresh + breach rules       |
+| Stage             | Agent               | Tool access                 |
+| ----------------- | ------------------- | --------------------------- |
+| Universe          | (TickerSelector)    | Alpaca assets, FRED         |
+| Analyst           | MarketDataAnalyst   | MCP read-only (chain, bars) |
+| Analyst           | NewsAnalyst         | MCP read-only (news)        |
+| Analyst           | MacroAnalyst        | FRED (Faraday)              |
+| Analyst           | InsiderAnalyst      | EDGAR (Faraday)             |
+| Debate            | BullResearcher      | none — pure LLM             |
+| Debate            | BearResearcher      | none — pure LLM             |
+| Debate            | ResearchManager     | none — single-shot gate     |
+| Trader            | Trader              | none — single-leg proposal  |
+| Position          | PositionReviewAgent | none — 30-min check         |
+| Position          | AdjustmentAgent     | none — proposes new leg     |
+| TickerSel         | TickerSelector      | Alpaca assets, FRED         |
+| **Deterministic** | RiskManager         | reads `trading.yml` limits  |
+| **Deterministic** | PortfolioManager    | trading MCP (broker)        |
+| **Deterministic** | PositionMonitor     | refresh + breach rules      |
 
 Every LLM call goes through:
+
 - `TradingConfig.fetch(:llm, :default_model)` for the model
 - `RATE_LIMITERS[:llm].with_limit(timeout:)` for the token bucket
 - `CIRCUIT_BREAKERS[:llm].call { ... }` for fault isolation
@@ -305,6 +381,7 @@ flowchart TB
 ```
 
 Key design choices:
+
 - **Historical options chains** are not reliably available from Alpaca's MCP; we synthesize them with Black-Scholes (constant IV placeholder, configurable per call). When a real historical options source is wired in, only `synthesize_chain` needs to change.
 - **Per-trade fill model** is `trading.yml -> backtest.fill_model` (`mid` / `ask_for_buys` / `bid_for_sells`) with `slippage_pct` and `commission_per_contract`.
 - **Run on `backtest-queue`**, not `trading-queue`, so a 30-day backtest can't starve the live pipeline.
@@ -382,12 +459,12 @@ curl -X POST http://localhost:3000/api/backtests/1/cancel
 
 ### URLs
 
-| Service       | URL                                     |
-|---------------|-----------------------------------------|
-| Front-end     | http://localhost:5173                   |
-| API           | http://localhost:3000/api/...           |
-| Temporal UI   | http://localhost:8233                   |
-| Postgres      | localhost:5432 (user/pass in .env)      |
+| Service     | URL                                |
+| ----------- | ---------------------------------- |
+| Front-end   | http://localhost:5173              |
+| API         | http://localhost:3000/api/...      |
+| Temporal UI | http://localhost:8233              |
+| Postgres    | localhost:5432 (user/pass in .env) |
 
 ## Environment variables
 
@@ -430,12 +507,14 @@ POST   /api/backtests/:id/cancel
 
 ## Temporal workers + task queues
 
-| Worker                    | Task queue        | Owns                                                |
-|---------------------------|-------------------|-----------------------------------------------------|
-| TickerSelectorWorker      | trading-queue     | daily ticker selection workflow + 4 activities      |
-| TradingWorkflowsWorker    | trading-queue     | Scheduler + ProcessTicker + 5 trading activities    |
-| PositionWorkflowsWorker   | position-queue    | Monitor + Review position + 2 activities            |
-| BacktestWorkflowsWorker   | backtest-queue    | Backtest + 1 activity                                |
+| Worker                  | Task queue     | Owns                                                                                                                                                                     |
+| ----------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| TickerSelectorWorker    | trading-queue  | daily ticker selection workflow + 4 activities                                                                                                                           |
+| TradingWorkflowsWorker  | trading-queue  | Scheduler + ProcessTicker + 5 trading activities                                                                                                                         |
+| PositionWorkflowsWorker | position-queue | RunMidBandMovers + MidBandMovers Sell + RunOvernightReversal + CloseOvernightReversal + RunMidBandMovers + Monitor + Review position + 7 ovn activities + 1 mbm activity |
+| BacktestWorkflowsWorker | backtest-queue | Backtest + 1 activity                                                                                                                                                    |
+
+Position-queue is the busy queue — it owns all three strategy runtimes plus the monitor/review workflows.
 
 `bin/worker` (no args) auto-discovers every concrete worker in `app/workers/` from the filename: `trading_workflows_worker.rb` → `TradingWorkflowsWorker`. The `Procfile` runs `bundle exec bin/worker` for the `worker` process.
 
@@ -454,6 +533,7 @@ backtest_trades             + others
 ```
 
 Key relationships:
+
 - `TradeProposal` → `AgentRun` (which agent made it) + `closes_position` (Position it closes)
 - `Position` ↔ `PositionReview` (review history)
 - `BacktestRun` → `BacktestTrade` (one-to-many)
