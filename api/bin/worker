@@ -1,0 +1,139 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# bin/worker — boot any worker or all workers in app/workers/.
+#
+# Usage:
+#   bin/worker                          # run every concrete worker in app/workers/
+#   bin/worker TickerSelectorWorker     # run only this one
+#   bin/worker TickerSelectorWorker SchedulerWorker   # run these two
+#
+# Each worker class declares which workflows, activities, and task queues it
+# owns. bin/worker wires up the T_CLIENT from the Temporal initializer,
+# groups worker classes by task queue, and instantiates ONE Temporalio
+# Worker per task queue (merging workflows/activities across the classes
+# that share the queue). Multiple worker classes can declare the same
+# task queue — they will be combined into one Temporal worker.
+#
+# === Tuner configuration ===
+#
+# Each worker class declares its Tuner slot defaults via
+# `tuner_settings` (a Hash with :workflow_slots, :activity_slots,
+# :local_activity_slots). The base ApplicationWorker provides a
+# conservative default; subclasses override the method (or call
+# `super.merge(...)`) to tune for their own resource profile. bin/worker
+# reads the class's settings and builds the Tuner from them. To tune a
+# worker, edit the class — there is no env-var override path.
+#
+# The Tuner caps how many workflows / activities / local activities the
+# worker polls in parallel from a single task queue. Without a Tuner, a
+# worker with N workflows in the queue can run all N in parallel — which
+# means N×(analyst LLM calls + debate LLM calls) hit the upstream
+# MiniMax / Anthropic rate limit at the same time. `activity_slots: 5`
+# is the throttle: at most 5 activities execute concurrently per task
+# queue.
+
+require_relative "../config/environment"
+
+# Force Zeitwerk to autoload all classes (workflows, activities, workers).
+Rails.application.eager_load!
+
+# Build a logger for the Temporalio workers + their activity scoped
+# loggers. The default Temporalio logger writes to STDERR and gets
+# lost in foreman / multi-pane terminals; this one writes to STDOUT
+# so `activity.logger.info` shows up in the same terminal as the
+# `[worker] starting` line. Set level to INFO to keep noise down.
+def worker_logger
+  require "logger"
+  logger = Logger.new($stdout)
+  logger.level = Logger::INFO
+  logger.formatter = Rails.logger.formatter if Rails.logger.respond_to?(:formatter)
+  logger
+end
+
+# Build a Temporalio::Worker::Tuner from a worker class's `tuner_settings`.
+# Falls back to the ApplicationWorker defaults if a subclass doesn't
+# override. When multiple worker classes share a task queue, the first
+# class's settings are used (each Tuner is a worker-level concept and
+# can't be merged; the clean answer is one task queue per worker class).
+def resolve_tuner(worker_class)
+  settings = worker_class.tuner_settings
+  Temporalio::Worker::Tuner.create_fixed(**settings)
+end
+
+# Discover concrete worker files under app/workers/. The base class
+# (application_worker.rb -> ApplicationWorker) is excluded.
+worker_files = Dir.glob(File.join(Rails.root, "app/workers", "*.rb"))
+worker_names = worker_files.map do |file_path|
+  File.basename(file_path, ".rb").split("_").map(&:capitalize).join
+end
+worker_names -= %w[ApplicationWorker]
+
+# Apply the arg filter. An unknown worker class name is an error.
+requested = if ARGV.empty?
+              worker_names
+            else
+              (ARGV & worker_names).tap do |matched|
+                missing = ARGV - worker_names
+                abort "[worker] unknown worker class(es): #{missing.inspect}\n" \
+                      "         available: #{worker_names.inspect}" if missing.any?
+                abort "[worker] no workers matched #{ARGV.inspect}. available: #{worker_names.inspect}" if matched.empty?
+              end
+            end
+
+# Group worker classes by task_queue. Each group becomes one Temporal worker.
+by_queue = Hash.new { |h, k| h[k] = { workflows: [], activities: [], classes: [] } }
+requested.each do |name|
+  worker_class = Object.const_get(name)
+  unless worker_class < ApplicationWorker
+    abort "[worker] #{name} is not a subclass of ApplicationWorker"
+  end
+
+  worker_class.task_queues.each do |task_queue|
+    by_queue[task_queue][:workflows]  |= worker_class.workflows_arr
+    by_queue[task_queue][:activities] |= worker_class.activities_arr
+    by_queue[task_queue][:classes]     << worker_class
+  end
+end
+
+workers = []
+by_queue.each do |task_queue, bundle|
+  # When multiple worker classes share a task queue, the FIRST class's
+  # Tuner settings win (we can't merge two Tuners into one). The clean
+  # way to give each class its own Tuner is to give it its own task
+  # queue, which the recent TickerSelector split already does.
+  owner_class = bundle[:classes].first
+  tuner_settings = owner_class.tuner_settings
+
+  # Build a synthetic worker class for this task queue so we can reuse the
+  # existing Temporalio::Worker constructor. The class name is cosmetic —
+  # the Temporal server only sees the task queue + workflow/activity lists.
+  klass = Class.new(Temporalio::Worker) do
+    define_method(:initialize) do |**opts|
+      super(
+        client: T_CLIENT,
+        workflows:  bundle[:workflows],
+        activities: bundle[:activities],
+        task_queue: task_queue,
+        tuner: resolve_tuner(owner_class),
+        # Route the activity/workflow scoped logger to STDOUT so the
+        # `activity.logger.info "[ticker_selector] ..."` lines (and the
+        # framework's own poll/heartbeat/error logs) show up in the
+        # same terminal as the `[worker] starting` line above. Without
+        # this, Temporalio's default `::Logger.new` writes to STDERR
+        # at DEBUG level and gets lost in the noise of foreman /
+        # multi-pane terminals.
+        logger: worker_logger,
+        **opts
+      )
+    end
+  end
+  worker = klass.new
+  workers << worker
+  puts "[worker]   - #{bundle[:classes].map(&:name).join(" + ")} on task_queue=#{task_queue} " \
+       "(#{bundle[:workflows].size} workflows, #{bundle[:activities].size} activities, " \
+       "tuner=#{tuner_settings.inspect})"
+end
+
+puts "[worker] starting #{workers.size} worker(s) across #{by_queue.size} task queue(s)"
+Temporalio::Worker.run_all(*workers, shutdown_signals: %w[SIGINT SIGTERM])

@@ -1,0 +1,13 @@
+Alpaca Paper Trading Account ID: PA3PR2RMFE9Y
+
+This is the live paper-trading account backing the Yield-paca platform.
+The account is connected to the API in config/master.key-protected
+credentials. Every order shown in the workflow logs and on the
+dashboard was placed against this account on Alpaca's paper-trading
+environment during the hackathon window (Aug 28 – Sep 4, 2026).
+
+How to verify:
+  1. Open https://app.alpaca.markets/paper/dashboard
+  2. Sign in with the credentials tied to this account ID
+  3. Match the trade activity against the run logs under
+     /app/api/log/development.log + Temporal UI at http://localhost:8233

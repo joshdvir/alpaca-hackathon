@@ -1,0 +1,48 @@
+# frozen_string_literal: true
+
+source 'https://rubygems.org'
+
+ruby '4.0.6'
+
+# Rails
+gem 'pg'
+gem 'propshaft'
+gem 'puma'
+gem 'rails'
+gem 'tzinfo-data', platforms: %i[windows jruby]
+
+# Reduces boot times through caching
+gem 'bootsnap', require: false
+
+# Database-backed cache (Rails.cache in production). Used for MCP
+# response caching to cut upstream API call counts.
+gem 'solid_cache'
+
+# LLM
+gem 'ruby_llm'
+gem 'ruby_llm-mcp'
+
+# Temporal
+gem 'temporalio'
+
+# HTTP clients (for FRED + SEC EDGAR)
+gem 'faraday'
+gem 'faraday-net_http'
+gem 'faraday-retry'
+gem 'faraday-gzip'
+
+# Typed Ruby for prompts / schemas
+gem 'dry-monads'
+gem 'dry-validation'
+
+group :development, :test do
+  gem 'brakeman', require: false
+  gem 'debug', platforms: %i[mri windows], require: 'debug/prelude'
+  gem 'factory_bot_rails'
+  gem 'foreman'
+  gem 'rspec-rails'
+  gem 'rubocop-rails-omakase', require: false
+  gem 'vcr'
+  gem 'webmock'
+  gem 'annotaterb'
+end

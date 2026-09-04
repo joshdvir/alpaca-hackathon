@@ -1,0 +1,27 @@
+# frozen_string_literal: true
+
+require "rails_helper"
+
+RSpec.describe "RiskManager debug" do
+  it "logs persist! errors" do
+    allow(File).to receive(:exist?).and_call_original
+    allow(File).to receive(:exist?).with(Rails.root.join("tmp/kill_switch")).and_return(false)
+    allow(Position).to receive(:open).and_return(Position.none)
+    allow(PortfolioSnapshot).to receive_message_chain(:where, :order, :first).and_return(nil)
+
+    ar = create_agent_run
+    proposal = TradeProposal.create!(
+      agent_run: ar, ticker: "SPY", kind: "new", strategy_type: "vertical",
+      legs: [{ "side" => "buy_to_open", "ratio_qty" => 1, "option_symbol" => "X" }],
+      max_loss: 500, max_profit: 500, status: "pending"
+    )
+
+    # Capture the persist! log line
+    expect(Rails.logger).to receive(:warn).with(/\[risk\]/).at_least(:once) do |msg|
+      puts "PERSIST ERR: #{msg}"
+      true
+    end
+
+    Risk::RiskManager.new.check(proposal)
+  end
+end

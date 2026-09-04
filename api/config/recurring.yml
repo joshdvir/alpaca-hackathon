@@ -1,0 +1,30 @@
+# Solid Queue recurring schedule.
+# https://github.com/rails/solid_queue
+#
+# === DEPRECATED ===
+# This file is no longer used. The `alpaca_mirror` schedule that used
+# to live here was never actually running — solid_queue is not in the
+# Gemfile, the tables don't exist, and the recurring-yml parser was
+# never invoked. As a result, the mirror never polled the broker and
+# fills never registered in the DB.
+#
+# The mirror is now a Temporal schedule (`alpaca-mirror` in
+# trading.yml -> temporal_schedules). It fires AlpacaMirrorWorkflow
+# -> SyncAlpacaActivity every minute, which calls AlpacaSync.sync_all
+# + broadcasts the latest snapshot over ActionCable. The
+# AlpacaMirrorWorker polls the dedicated `alpaca-mirror-queue`.
+#
+# This file is kept temporarily for reference. Delete it once the
+# Temporal mirror is verified working in production.
+
+production:
+  alpaca_mirror:
+    class: AlpacaMirrorJob
+    queue: default
+    every: 30s
+
+development:
+  alpaca_mirror:
+    class: AlpacaMirrorJob
+    queue: default
+    every: 30s

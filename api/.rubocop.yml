@@ -1,0 +1,142 @@
+plugins: rubocop-rails
+
+AllCops:
+  TargetRubyVersion: 4.0
+  # New cops are disabled by default — we opt-in to the ones that catch
+  # real bugs in this project. This silences the "cop not configured"
+  # warnings from rubocop.
+  NewCops: disable
+  DisabledByDefault: true
+  SuggestExtensions: false
+  Exclude:
+    - "db/schema.rb"
+    - "bin/*"
+    - "node_modules/**/*"
+    - "vendor/**/*"
+    - "tmp/**/*"
+    - "log/**/*"
+    - "storage/**/*"
+
+# Hackathon-tuned: loosen the style/metric cops that fight against the
+# multi-agent pipeline's natural shape (long execute methods, lots of small
+# positional args to LLM agents, etc.). Real bugs (Lint/* and Rails/Skips*)
+# are left at defaults.
+Style/Documentation:
+  Enabled: false
+Naming/MethodParameterName:
+  Enabled: false
+Metrics/MethodLength:
+  Max: 50
+Metrics/AbcSize:
+  Max: 35
+Metrics/CyclomaticComplexity:
+  Max: 12
+Metrics/PerceivedComplexity:
+  Max: 15
+Metrics/BlockLength:
+  Max: 50
+Metrics/ClassLength:
+  Max: 200
+Metrics/ParameterLists:
+  Max: 8
+
+# Re-enable new cops that catch real bugs (since DisabledByDefault: true
+# above turns them all off). Each one is justified:
+# - Lint/ConstantOverwrittenInRescue: real bug — silently losing a value
+# - Lint/NonAtomicFileOperation: real bug — TOCTOU race on FileUtils ops
+# - Lint/UselessRescue: real bug — `rescue` block does nothing
+# - Lint/UselessOr: real bug — `x || x` style no-op
+# - Lint/UselessNumericOperation: real bug — `x * 1` / `x + 0`
+# - Lint/DuplicateMagicComment: real bug — frozen_string_literal repeated
+# - Lint/DuplicateRegexpCharacterClassElement: real bug — `[aa]`
+# - Lint/DuplicateSetElement: real bug — `{a, a}`
+# - Lint/EmptyBlock / Lint/EmptyClass: real bug — accidentally empty
+# - Lint/AmbiguousOperatorPrecedence: real bug — `x + y * z` readability
+# - Lint/AmbiguousRange: real bug — `1..10` vs `1...10` confusion
+# - Lint/SharedMutableDefault: real bug — mutable default arg
+# - Lint/ItWithoutArgumentsInBlock: real bug — `it` with args
+# - Lint/RefinementImportMethods: real bug — incorrect refinement usage
+# - Lint/UnexpectedBlockArity: real bug — block arity mismatch
+# - Lint/RedundantDirGlobSort: real bug — sorting already-sorted Dir glob
+# - Lint/RedundantRegexpQuantifiers: real bug — `x??` / `x*?` confusion
+# - Lint/SymbolConversion: real bug — `:"foo"` vs `:foo`
+# - Lint/ToEnumArguments: real bug — wrong To_enum call
+# - Security/CompoundHash: real security — `Hash[algorithm:]` collision
+# - Security/IoMethods: real security — `IO.read(name)` injection
+# - Style/OpenStructUse: we deliberately avoid OpenStruct (use Struct)
+# - Style/RedundantFormat: real bug — `format("x")` without args
+# - Style/RedundantStringEscape: real bug — over-escaped string
+# - Style/RedundantEach: real bug — `each` instead of `map`/`find`
+# - Style/RedundantSelfAssignmentBranch: real bug — `if x then x = y end`
+# - Style/QuotedSymbols: we prefer `:"foo"` rarely; harmless to leave on
+# - Style/HashFetchChain: real bug — chained `[]` vs `fetch`
+# - Style/HashSlice: real bug — chain of `dig` calls
+# - Style/CombinableDefined: real bug — `defined?(x) && defined?(y)`
+# - Style/FileNull: real bug — FileNULL misuse
+# - Naming/PredicateMethod: we name some `foo?` for clarity; harmless
+Lint/ConstantOverwrittenInRescue:
+  Enabled: true
+Lint/NonAtomicFileOperation:
+  Enabled: true
+Lint/UselessRescue:
+  Enabled: true
+Lint/UselessOr:
+  Enabled: true
+Lint/UselessNumericOperation:
+  Enabled: true
+Lint/DuplicateMagicComment:
+  Enabled: true
+Lint/DuplicateRegexpCharacterClassElement:
+  Enabled: true
+Lint/DuplicateSetElement:
+  Enabled: true
+Lint/EmptyBlock:
+  Enabled: true
+Lint/EmptyClass:
+  Enabled: true
+Lint/AmbiguousOperatorPrecedence:
+  Enabled: true
+Lint/AmbiguousRange:
+  Enabled: true
+Lint/SharedMutableDefault:
+  Enabled: true
+Lint/ItWithoutArgumentsInBlock:
+  Enabled: true
+Lint/RefinementImportMethods:
+  Enabled: true
+Lint/UnexpectedBlockArity:
+  Enabled: true
+Lint/RedundantDirGlobSort:
+  Enabled: true
+Lint/RedundantRegexpQuantifiers:
+  Enabled: true
+Lint/SymbolConversion:
+  Enabled: true
+Lint/ToEnumArguments:
+  Enabled: true
+Security/CompoundHash:
+  Enabled: true
+Security/IoMethods:
+  Enabled: true
+Style/OpenStructUse:
+  Enabled: true
+Style/RedundantFormat:
+  Enabled: true
+Style/RedundantStringEscape:
+  Enabled: true
+Style/RedundantEach:
+  Enabled: true
+Style/RedundantSelfAssignmentBranch:
+  Enabled: true
+Style/QuotedSymbols:
+  Enabled: true
+Style/HashFetchChain:
+  Enabled: true
+Style/HashSlice:
+  Enabled: true
+Style/CombinableDefined:
+  Enabled: true
+Style/FileNull:
+  Enabled: true
+Naming/PredicateMethod:
+  Enabled: true

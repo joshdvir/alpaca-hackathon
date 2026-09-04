@@ -1,0 +1,192 @@
+# Trader — local dev compose
+# Brings up postgres, temporal, alpaca-mcp, the Rails api (worker + web), and the Vue front.
+# Run: docker compose up -d
+# Then: docker compose exec api bash   (or: docker compose exec front bash)
+#
+# All env vars come from .env via the env_file directive. The compose file
+# itself contains no secrets. Service config (paths, ports) lives in compose.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: trader-postgres
+    env_file:
+      - .env.example
+      - .env
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-trader} -d ${POSTGRES_DB:-trading}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  temporal:
+    image: temporalio/temporal:latest
+    container_name: trader-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env.example
+      - .env
+    command: ["server", "start-dev", "--ip", "0.0.0.0"]
+    ports:
+      - "7233:7233" # gRPC
+      - "8233:8233" # Web UI
+
+  alpaca-mcp:
+    build:
+      context: .
+      dockerfile: mcp/alpaca/Dockerfile
+    image: trader/alpaca-mcp:latest
+    container_name: trader-alpaca-mcp
+    env_file:
+      - .env.example
+      - .env
+    environment:
+      ALPACA_TOOLSETS: "account,trading,stock-data,options-data,news,assets"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8000/mcp || true"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # --- Additional data + sentiment MCP servers. ---
+  # Each one is a separate service so a single failure doesn't take
+  # down the whole pipeline. The API connects to whichever ones are
+  # up; the others are gracefully skipped (or the pipeline logs a
+  # warning and continues with the remaining sources).
+  #
+  # See mcp/<server>/README.md for env vars and what each one
+  # provides. Add the corresponding URL under api/Rails'
+  # TRADING_CONFIG[:mcp][:servers] entry to register a server.
+  tradingview-mcp:
+    build:
+      context: .
+      dockerfile: mcp/tradingview/Dockerfile
+    image: trader/tradingview-mcp:latest
+    container_name: trader-tradingview-mcp
+    env_file:
+      - .env.example
+      - .env
+    ports:
+      - "8001:8001"
+
+  optionsflow-mcp:
+    build:
+      context: .
+      dockerfile: mcp/optionsflow/Dockerfile
+    image: trader/optionsflow-mcp:latest
+    container_name: trader-optionsflow-mcp
+    env_file:
+      - .env.example
+      - .env
+    ports:
+      - "8003:8003"
+
+  # twitter-mcp:
+  #   build:
+  #     context: .
+  #     dockerfile: mcp/twitter/Dockerfile
+  #   image: trader/twitter-mcp:latest
+  #   container_name: trader-twitter-mcp
+  #   env_file:
+  #     - .env.example
+  #     - .env
+  #   ports:
+  #     - "8005:8005"
+
+  # bluesky-mcp:
+  #   build:
+  #     context: .
+  #     dockerfile: mcp/bluesky/Dockerfile
+  #   image: trader/bluesky-mcp:latest
+  #   container_name: trader-bluesky-mcp
+  #   env_file:
+  #     - .env.example
+  #     - .env
+  #   ports:
+  #     - "8006:8006"
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: trader/api:latest
+    container_name: trader-api
+    env_file:
+      - .env.example
+      - .env
+    environment:
+      RAILS_ENV: development
+      TRADING_CONFIG_PATH: /app/config/trading.yml
+      PORT: "3000"
+      # Override the Dockerfile's BUNDLE_DEPLOYMENT=1 so the container can
+      # boot and run `bundle install` to generate Gemfile.lock on the host
+      # via the bind mount. Re-enable for production builds.
+      BUNDLE_DEPLOYMENT: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      alpaca-mcp:
+        condition: service_healthy
+      tradingview-mcp:
+        condition: service_started
+      optionsflow-mcp:
+        condition: service_started
+      # twitter-mcp:
+      #   condition: service_started
+      # bluesky-mcp:
+      #   condition: service_started
+    volumes:
+      - ./api:/app
+    # docker-entrypoint clears the stale pids file then execs the CMD.
+    # CMD below runs foreman which spawns both the worker and the web from Procfile.
+    entrypoint: /app/bin/docker-entrypoint
+    # command: ["bundle", "exec", "foreman", "start"]
+    command:
+      - sleep
+      - "infinity"
+    ports:
+      - "3000:3000"
+    tty: true
+    stdin_open: true
+
+  front:
+    build:
+      context: ./front
+      dockerfile: Dockerfile
+    image: trader/front:latest
+    container_name: trader-front
+    depends_on:
+      - api
+    env_file:
+      - .env.example
+      - .env
+    volumes:
+      - ./front:/app
+      - front_node_modules:/app/node_modules
+    environment:
+      # Vite's dev server proxies /api/* to this URL inside the docker network.
+      VITE_API_PROXY_TARGET: http://api:3000
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+    ports:
+      - "5173:5173"
+    tty: true
+    stdin_open: true
+
+volumes:
+  postgres-data:
+  front_node_modules:

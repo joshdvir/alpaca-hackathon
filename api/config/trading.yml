@@ -1,0 +1,1269 @@
+# =============================================================================
+# Trading Multi-Agent — algorithm config
+# =============================================================================
+# This file is the single source of truth for every prompt, threshold, and
+# decision parameter the system uses. Code reads from TRADING_CONFIG; nothing
+# is hardcoded.
+#
+# Path is overridable via TRADING_CONFIG_PATH env var (default: config/trading.yml).
+# ERB is supported so env-var interpolation works.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Watchlist — populated by TickerSelector workflow each morning
+# -----------------------------------------------------------------------------
+watchlist:
+  tickers: [] # placeholder; TickerSelector writes to watchlist_entries
+  default_lookback_days: 30
+  max_concurrent_analyst_tickers: 8
+
+# -----------------------------------------------------------------------------
+# LLM provider — MiniMax via OpenAI-compatible endpoints
+# -----------------------------------------------------------------------------
+llm:
+  default_provider: openai # RubyLLM uses the OpenAI adapter
+  default_model: <%= ENV["DEFAULT_MODEL"] %>
+  model: MiniMax-M3 # canonical model name used by RubyLLM.anthropic-compatible path
+  rate_limit_per_minute: 90 # legacy flat LLM rate cap (also see rate_limiters.llm)
+  request_timeout_seconds: 120
+  acquire_timeout_seconds: 30 # how long the rate-limiter blocks per LLM call
+  openai:
+    api_key: <%= ENV["MINIMAX_API_KEY"] %>
+    api_base: <%= ENV["MINIMAX_API_BASE"] || "https://api.minimax.io/v1" %>
+
+# -----------------------------------------------------------------------------
+# Workflow timing
+# -----------------------------------------------------------------------------
+workflow:
+  tick_interval_minutes: 5
+  research_plan_ttl_hours: 4
+  position_min_hold_hours: 2
+  cooldown_after_no_consensus_hours: 1
+  pause_after_risk_rejections:
+    threshold: 3
+    duration_hours: 4
+  catalyst_overrides:
+    - earnings_within_days: 1
+    - fomc_meeting_day: true
+    - insider_form4_cluster_threshold: 3
+
+  # Scheduler (the long-running workflow that launches per-ticker workflows)
+  scheduler_reconcile_minutes: 5
+  # Lower the batch size so the LLM burst per cycle stays under
+  # the upstream provider's per-second rate limit. With 4 tickers
+  # × 7 LLM calls = 28 calls in a burst (vs 70 with 10 tickers),
+  # the 4/sec rate budget absorbs the spike cleanly.
+  ticker_batch_size: 2
+  inter_batch_delay_seconds: 30
+  per_ticker_launch_stagger_ms: 500
+
+# -----------------------------------------------------------------------------
+# Temporal Schedules — managed by Temporal Cloud / server, NOT Rails cron.
+#
+# The api process connects to Temporal on boot and ensures these schedules
+# exist (idempotently). Workflows are then triggered by Temporal itself
+# (cron), so a worker restart doesn't lose scheduling. Inspect / pause /
+# trigger manually via the Temporal UI at http://localhost:8233.
+#
+# Each schedule fires its workflow on a cron and the workflow does a
+# single pass (no internal loop). The api container just needs to have
+# a worker polling the right task queues.
+# -----------------------------------------------------------------------------
+# Note: ProcessTickerWorkflow is a long-running per-ticker child
+# workflow (cycle_minutes per ticker). It is NOT scheduled by Temporal —
+# it is launched by the trading-scheduler-reconcile schedule below.
+temporal_schedules:
+  # All schedules below are scoped to market hours (8:00 AM – 4:59 PM
+  # ET, Mon–Fri) in America/New_York. That's ~9 hours of scheduled
+  # ticks per weekday instead of 24/7, which:
+  #   - saves broker round-trips when the market is closed
+  #   - keeps the Temporal UI clean (no overnight workflow noise)
+  #   - dodges weekend data churn
+  # The window is slightly wider than the user's spec (8:30 AM – 4:15
+  # PM ET) because a single 5-field cron can't express "30–59 of hour 8
+  # AND 0–14 of hour 16" as a clean range. The 30 min early + 45 min
+  # late are no-ops when the market is closed (the workflows just see
+  # no new data and finish fast). 8:00 ET = 60 min before open; 4:59
+  # ET = 59 min after close — both still well outside market hours.
+  - id: "alpaca-mirror"
+    # Fire AlpacaMirrorWorkflow every minute, 24/7 — including
+    # weekends and after-hours. The workflow calls SyncAlpacaActivity
+    # (AlpacaSync.sync_all), which syncs account snapshot, positions
+    # (creates Position rows on fresh fills), orders (updates status
+    # from broker, creates Fill rows), and broadcasts the latest
+    # snapshot over ActionCable. Running outside market hours lets
+    # the mirror catch after-hours option assignments, weekend
+    # account changes, and the next session's open state.
+    # Worker: app/workers/alpaca_mirror_worker.rb.
+    workflow: "AlpacaMirrorWorkflow"
+    task_queue: "alpaca-mirror-queue"
+    cron: "*/1 * * * *"
+    timezone: "America/New_York"
+    enabled: true
+    note: "Sync account/positions/orders from broker to DB every minute, 8AM-5PM ET Mon-Fri (market hours)"
+  - id: "ticker-selector-daily"
+    # Temporal uses the workflow's unqualified class name as the
+    # registered type (TickerSelectorWorkflow, not the full
+    # TickerSelector::TickerSelectorWorkflow Ruby constant path).
+    # The worker registers it under this name; the schedule must match.
+    # 8:30 AM ET = 60 min before the 9:30 AM market open. Runs
+    # Mon–Fri so weekend scheduler ticks don't queue up empty
+    # processing-ticker workflows.
+    workflow: "TickerSelectorWorkflow"
+    task_queue: "ticker-selector-queue" # dedicated queue (see TickerSelectorWorker)
+    cron: "30 8 * * 1-5"
+    timezone: "America/New_York"
+    enabled: true
+    note: "Daily ticker selection and watchlist refresh, 8:30 AM ET Mon-Fri (60 min before market open)"
+  - id: "trading-scheduler-reconcile"
+    workflow: "SchedulerWorkflow"
+    task_queue: "trading-queue"
+    cron: "*/15 8-16 * * 1-5"
+    timezone: "America/New_York"
+    enabled: true
+    note: "Reconcile watchlist and launch due ProcessTickerWorkflow children every 15 min, 8AM-5PM ET Mon-Fri"
+  - id: "position-review-all"
+    # Every 30 min during market hours, fire ReviewAllPositionsWorkflow
+    # which iterates over open positions and spawns one parented child
+    # ReviewPositionWorkflow per position. Each child is one-shot
+    # (one LLM call). Skips positions that have already hit
+    # `exit_after_hold_cycles` consecutive hold verdicts (the
+    # `Position.hold_streak` column tracks this).
+    workflow: "ReviewAllPositionsWorkflow"
+    task_queue: "position-queue"
+    cron: "*/30 8-16 * * 1-5"
+    timezone: "America/New_York"
+    enabled: true
+    note: "30-min LLM review of every open position, 8AM-5PM ET Mon-Fri (market hours)"
+  - id: "mid-band-movers"
+    # Mid-Band Movers strategy (non-LLM, deterministic). Fires once
+    # at 11:30 AM ET (2h after the 9:30 AM market open), Mon-Fri.
+    # The workflow:
+    #   1. BuildPlanActivity     → pull movers + universe + BP, run pure-Ruby planning
+    #   2. SubmitBuyOrdersActivity → 3 buckets of ATM 30-DTE long calls
+    #   3. Spawn one SellWorkflow child per submitted order; each child
+    #      sleeps until `planned_sell_at` and then submits a market
+    #      sell_to_close via SubmitSellOrderActivity.
+    # The parent exits immediately after spawning children. The
+    # children own the long-lived wait. Bucket holds are 2h / 4h /
+    # 23.5h so the latest child runs overnight — that's fine, the
+    # worker slot is freed as soon as the sleep timer fires.
+    workflow: "RunMidBandMoversWorkflow"
+    task_queue: "position-queue"
+    cron: "30 11 * * 1-5"
+    timezone: "America/New_York"
+    enabled: true
+    note: "Mid-Band Movers: 3-bucket ATM 30-DTE long-call plan, 11:30 AM ET Mon-Fri"
+  - id: "overnight-reversal"
+    # Overnight Reversal strategy — pure deterministic, no LLM.
+    # Fires at 9:35 AM ET (5 min after open, so yesterday's daily
+    # bars are settled on TradingView's screens). Pipeline:
+    #   1. BuildPlanActivity         → screen winners/losers, build plan
+    #   2. SubmitOrdersActivity      → winners (long calls) + losers (bear call spreads)
+    #   3. Spawn one CloseWorkflow child that sleeps to 15:55 ET and
+    #      then runs ClosePositionsActivity to flatten everything
+    #      (market-close expiry handling for 0DTE).
+    # The parent exits immediately after spawning the close child.
+    # Positions carry origin: 'overnight_reversal' so the LLM review
+    # path skips them (positions from this strategy close on schedule).
+    workflow: "OvernightReversal::RunOvernightReversalWorkflow"
+    task_queue: "position-queue"
+    cron: "35 9 * * 1-5"
+    timezone: "America/New_York"
+    enabled: true
+    note: "Overnight Reversal: 5 winners (long call) + 5 losers (bear call spread), 0DTE, close 15:55 ET Mon-Fri"
+
+analyst_agents:
+  market_data:
+    enabled: true
+    frequency_minutes: 5
+    tools: [get_stock_bars, get_option_chain, get_option_snapshot]
+    prompt: |
+      You are a market data analyst for an options trading system.
+      For the given ticker, summarize the current options landscape:
+        - IV rank (0-100) based on the recent price range
+        - Key strikes with the most open interest
+        - Recent price action (5-day and 30-day)
+        - Implied move vs realized move
+        - Volume patterns
+      Return JSON matching the schema. Do not invent numbers; if a value is
+      missing, lower your confidence and note it in the rationale.
+
+  news:
+    enabled: true
+    frequency_minutes: 15
+    tools: [get_news]
+    prompt: |
+      You are a news analyst. Summarize recent news for the given ticker.
+      Identify overall sentiment (bullish / bearish / neutral), key catalysts,
+      and any upcoming events (earnings, FDA, macro). Return JSON with
+      sentiment, key_catalysts (array), and a 2-3 sentence summary.
+
+  macro:
+    enabled: true
+    frequency_minutes: 30
+    tools: [get_vix, get_treasury_rates]
+    prompt: |
+      You are a macro analyst. Assess the current volatility regime and
+      macro backdrop (VIX level, treasury rates, yield curve).
+      Return JSON with:
+        - regime: high_vol | low_vol | neutral
+        - vix_level: number
+        - rationale: 1-2 sentences
+
+  insider:
+    enabled: true
+    frequency_minutes: 1440 # daily
+    daily_run_at: "16:00" # 4pm ET
+    tools: [get_recent_form4s]
+    prompt: |
+      You are an insider activity analyst. Review the recent Form 4
+      transactions and identify cluster buying/selling by insiders.
+      Return JSON with:
+        - insider_signal: bullish | bearish | neutral | n_a
+        - confidence: 0-100
+        - notable_filers: array of {name, relationship, transaction_summary}
+        - rationale: 1-2 sentences
+
+# -----------------------------------------------------------------------------
+# Debate agents (Bull, Bear, ResearchManager)
+# -----------------------------------------------------------------------------
+debate_agents:
+  bull:
+    prompt: |
+      You are the bull researcher. Given the analyst reports below, build
+      the strongest long case for the ticker. Identify the top 3 supporting
+      points, quantify the upside scenario with concrete numbers, and note
+      the most plausible catalyst. Be specific — vague reasoning is rejected.
+
+  bear:
+    prompt: |
+      You are the bear researcher. Given the analyst reports below, build
+      the strongest short case for the ticker. Identify risks, fragility,
+      and specific scenarios where the bull case breaks down. Quantify the
+      downside with concrete numbers. Be specific.
+
+  research_manager:
+    prompt: |
+      You are the research manager. Given the bull and bear cases, synthesize
+      a balanced view. Output a typed ResearchPlan JSON with:
+        - recommendation: bullish | bearish | neutral
+        - confidence: 0-100
+        - key_catalysts: array of strings
+        - invalidation_conditions: array of strings
+        - rationale: 1-2 sentences explaining the synthesis
+      If the cases are roughly balanced, recommend "neutral" with low confidence.
+    min_confidence_for_trade: 30
+
+# -----------------------------------------------------------------------------
+# Trader agent (LLM, designs the actual option strategy)
+# -----------------------------------------------------------------------------
+trader_agent:
+  prompt: |
+    You are the trader. Given a ResearchPlan with a directional
+    recommendation and confidence > 40, design a concrete options strategy.
+    Output a TradeProposal JSON with:
+      - strategy_type: iron_condor | vertical | straddle | strangle | calendar | hold
+      - legs: array of {side: buy|sell, ratio_qty: 1, option_symbol: OCC_symbol}
+      - max_loss: dollars (positive number)
+      - max_profit: dollars (positive number)
+      - rationale: text explaining the choice
+    Choose the simplest strategy that expresses the directional view.
+    Prefer defined-risk strategies (verticals, iron condors) over undefined-risk
+    ones (naked shorts). Liquid strikes only (open interest > 100, tight spreads).
+
+    === ACCOUNT OPTIONS LEVEL (CRITICAL) ===
+    Your account's `options_approved_level` is in the payload. The broker
+    will REJECT any order whose side is not allowed at that level. The
+    allowed sides per level are:
+
+      Level 0  → no options at all
+      Level 1  → covered call + cash-secured put only
+                  (open: buy_to_open, sell_to_open [covered]; close: any)
+      Level 2  → long calls/puts only
+                  (open: buy_to_open; close: buy_to_close, sell_to_close)
+                  — sell_to_open is NOT allowed at this level
+      Level 3  → spreads (verticals, iron condors)
+                  (open: buy_to_open; sell_to_open only as part of a
+                  multi-leg spread where another leg is buy_to_open)
+                  — naked sell_to_open is NOT allowed at this level
+      Level 4  → all sides including naked writing
+
+    If your chosen strategy uses a side not allowed at the account's
+    level, return strategy_type: "hold" with a rationale explaining
+    that the account is level N and the strategy would require level M.
+    The server will reject any non-conforming order; a "hold" saves
+    the LLM call and gives the operator a clean audit trail.
+
+    A common case on a level-3 paper account: you cannot
+    `sell_to_open` a naked call (that requires level 4). Use a
+    vertical spread instead (buy_to_open the lower strike +
+    sell_to_open the higher strike) — the short leg is "covered" by
+    the long leg in the same order and the broker accepts it.
+
+    === PAPER ACCOUNT DEFAULT (PREFERRED STRATEGY) ===
+    This deployment runs on a PAPER account. Prefer simple long-only
+    strategies (`buy_to_open` a call or a put) over multi-leg spreads.
+    Long-only is the lowest-friction path:
+
+      - works at any options_approved_level >= 1 (no naked-writing needed)
+      - never trips the level safety net
+      - is the cleanest signal to test the pipeline end-to-end
+      - gives the operator a single, scannable position per ticker
+
+    If the ResearchPlan direction is bullish, `buy_to_open` a call.
+    If bearish, `buy_to_open` a put. Only escalate to a vertical
+    spread (long the lower strike + short the higher strike, with
+    `buy_to_open` on both legs) when the plan is strongly directional
+    AND you need the defined-risk cap that a spread provides.
+
+# -----------------------------------------------------------------------------
+# Position review (LLM, re-evaluates each open position)
+# -----------------------------------------------------------------------------
+position_review_agent:
+  prompt: |
+    You are the position review agent. You will be given the original
+    research plan, the original trade proposal, the current market state,
+    and the time elapsed since entry. Decide whether to hold, close, roll,
+    adjust, or add. Output a PositionReview JSON with:
+      - thesis_still_valid: bool
+      - thesis_evolution: 1-2 sentence description of what changed
+      - current_iv_vs_entry: number (e.g., -0.20 = 20% IV crush)
+      - delta_drift: number
+      - time_decay_consumed_pct: 0-100
+      - recommendation: hold | close | roll | adjust | add
+      - rationale: text
+      - new_legs: array of {side, ratio_qty, option_symbol} (only if roll/adjust/add)
+
+# -----------------------------------------------------------------------------
+# Adjustment agent (LLM, designs new legs when rolling or adjusting)
+# -----------------------------------------------------------------------------
+adjustment_agent:
+  prompt: |
+    You are the adjustment agent. You will be given an existing open
+    position and a directive (roll, adjust, or add). Design the new legs
+    that achieve the directive while:
+      - Improving net Greeks (delta closer to neutral, theta positive if possible)
+      - Keeping the trade within max_loss tolerance
+      - Using liquid strikes
+      - Avoiding transaction costs that exceed the expected benefit
+    Output a TradeProposal JSON with the same shape as a new trade proposal,
+    but kind=roll|adjust|add.
+
+# -----------------------------------------------------------------------------
+# TickerSelector (LLM, daily ticker recommendation)
+# -----------------------------------------------------------------------------
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITERIA CHEAT-SHEET (also documented inline below)
+# ─────────────────────────────────────────────────────────────────────────────
+# Every key under `criteria:` controls a single check the FilterEngine runs
+# against each ticker. If a ticker fails ANY check, it's out.
+#
+#   avGd_lIquIdIty (how much money flows through this stock every day)
+#     avg_dollar_volume_min: 100_000_000
+#       Example: 100_000_000 means at least $100M of stock trades hands every
+#       day. Picture 100,000 grown-ups each buying a $1,000 share — that's
+#       how much action we want. If only $1M trades, it's a ghost town.
+#       Tiny:    10_000_000   ($10M/day — small-cap, hard to sell quickly)
+#       Healthy: 50_000_000   ($50M/day — most big stocks clear this)
+#       Big:     100_000_000  ($100M/day — AAPL, MSFT territory)
+#       Mega:    1_000_000_000 ($1B/day — the giant names)
+#
+#   pct_change_*_min / pct_change_*_max (how much the price moved)
+#     pct_change_7d_min: 5     # went up at least 5% in the last 7 days
+#     pct_change_7d_max: 50    # but NOT up more than 50% (crazy spikes)
+#     pct_change_30d_min: -10  # OR went DOWN at least 10% in 30 days
+#     *Replace the number (7, 30) with the days window. Clamped to whatever
+#     data we actually have, so a 7d request with only 4 daily bars
+#     becomes a 4d change. Better than silently getting 0%.
+#     Example: a stock at $100 last week now at $105 = +5%.
+#     Example: a stock at $100 last week now at $115 = +15% (passes 5%, fails 50%? no, passes 50% too).
+#     Note: _min and _max can be combined to make a "sweet spot" filter.
+#
+#   iv_rank_min (how jumpy the options are)
+#     iv_rank_min: 60
+#       0   = options are super cheap, the stock is sleeping
+#       50  = options are normal price
+#       100 = options are super expensive, the stock is wild
+#       We want to SELL options to rich-jumpy names (collect the high price).
+#       60 means "kinda jumpy, good for selling premium".
+#
+#   rsi_max (how tired the price is)
+#     rsi_max: 30
+#       RSI is a "tired-o-meter" from 0 to 100.
+#         0-30   = the price has been FALLING a lot, it's exhausted → might bounce up
+#         30-70  = normal, no strong signal
+#         70-100 = the price has been RISING a lot, it's exhausted → might drop
+#       rsi_max: 30 means "only let through tickers that are super tired from
+#       falling" (good for "buy the dip" trades).
+#       rsi_min: 70 would mean "only let through tickers super tired from rising"
+#       (good for "short the top" trades).
+#
+#   earnings_within_days_max (when the company next announces results)
+#     earnings_within_days_max: 5
+#       Every few months, the company tells everyone how much money it made.
+#       That announcement is a BIG deal — the stock jumps around wildly.
+#       We want to be in the trade BEFORE that happens.
+#       5 = "earnings is happening in the next 5 days".
+#       30 = "earnings is happening in the next month".
+#       Implemented via Alpaca news keyword detection (weak signal — see note below).
+#
+#   insider_buys_min + insider_value_min + lookback_days (bosses buying their own stock)
+#     insider_buys_min: 3        # at least 3 bosses bought
+#     insider_value_min: 1_000_000 # and they put in at least $1M total
+#     lookback_days: 7           # and this happened in the last 7 days
+#       When the CEO/CFO of a company buys their OWN stock, they probably
+#       think it'll go up. If LOTS of them do it in a SHORT time, that's
+#       a strong signal.
+#       3 bosses × $1M each = $3M of insider money = bullish.
+#       Implemented via Alpaca news keyword detection (weak signal — see note
+#       below). For real Form-4 data, plug in an SEC EDGAR client instead.
+#
+#   max_results (cap on how many tickers this filter outputs)
+#     max_results: 25
+#       After all the filtering, keep at most 25 winners. Lower = fewer
+#       candidates to LLM-rank, faster cycle. 25 is a sweet spot.
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA-SOURCE NOTE
+# ─────────────────────────────────────────────────────────────────────────────
+# The Alpaca MCP server does NOT expose an earnings calendar or SEC Form-4
+# insider feed. We approximate both from `get_news` (Alpaca news headlines):
+#   - earnings_within_days_max: counts recent news items whose headline
+#     mentions "earnings", "guidance", "reports", "EPS", or "quarter".
+#   - insider_*_min: counts recent news items whose headline mentions
+#     "insider" AND ("buy"/"buys"/"purchas*") with a $ amount.
+# These are weak signals. They will be NOISY. If you need real earnings/insider
+# data, wire in a dedicated provider (SEC EDGAR, Alpha Vantage, Polygon, etc.)
+# and replace `news_has_earnings_keyword?` / `news_has_insider_buy_keyword?`
+# in app/ticker_selector/ticker_selector/filter_engine.rb.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ticker_selector:
+  enabled: true
+  frequency: daily
+  run_at: "08:00"
+  timezone: "America/New_York"
+  max_filter_activities: 500 # cap on FilterEngine score computations per cycle
+
+  universe:
+    source: alpaca_assets
+    # Curated list of high-volume, optionable, actively-traded US
+    # equities. The full MCP universe is ~6,300 names but 90% are
+    # OTC garbage; the API returns them in alphabetical order so the
+    # first N are never the names we want. This list sidesteps that
+    # for the hackathon — replace with a smarter source (e.g. ranking
+    # by volume) on a paid tier.
+    #
+    # When `manual_tickers:` is present, UniverseProvider uses it
+    # INSTEAD of the MCP asset list.
+    manual_tickers:
+      # Curated 20-ticker list (user-provided minimal config). Replaces
+      # the 95-name liquid-large-cap universe. We keep this list under
+      # `manual_tickers:` so UniverseProvider uses it INSTEAD of the
+      # MCP asset list (alphabetical noise).
+      # - AAPL
+      # - MSFT
+      # - NVDA
+      # - GOOGL
+      # - META
+      # - AMZN
+      # - TSLA
+      # - JPM
+      # - V
+      # - UNH
+      # - XOM
+      # - CVX
+      # - LLY
+      # - AVGO
+      # - COST
+      # - WMT
+      # - PG
+      # - HD
+      - MA
+      - BAC
+    max_size: 20000
+    filters:
+      asset_class: us_equity
+      status: active
+      tradable: true
+      attributes: ["has_options"]
+    exclude: []
+
+  max_recommended: 500
+  min_recommended: 3
+  default_cycle_minutes: 30
+
+  guardrails:
+    avg_dollar_volume_min: 50_000_000
+    options_chain_required: true
+    min_strikes_with_oi: 20
+    max_symbol_length: 5 # reject OTC/foreign junk with long tickers
+
+  prompt: |
+    You are the ticker selector. Given the filtered candidate tickers
+    below, rank the top N and explain your rationale. Consider liquidity,
+    recent news, and current volatility regime. Output a JSON array of:
+      { ticker, confidence: 0-100, source_filter, rationale: text }
+
+  filters:
+    # ─────────────────────────────────────────────────────────────────────
+    # 1. insider_buying_cluster — bosses buying their own stock
+    # ─────────────────────────────────────────────────────────────────────
+    # Why:  When the CEO and other big bosses use their own money to buy
+    #       their company's stock, they probably think it'll go up.
+    # Like:  If the lunch lady eats her own cooking, you know it's good.
+    # Source: SEC EDGAR Form 4 filings via EdgarClient. We count
+    #         open-market PURCHASES (transaction code 'P') by any
+    #         reporting person in the last `lookback_days` days.
+    - name: insider_buying_cluster
+      enabled: true
+      priority: 1
+      cycle_minutes: 30
+      type: insider
+      criteria:
+        # Relaxed from 2 buys / $500K / 14d → 1 buy / $100K / 30d so
+        # more small-cap and recent-cluster activity qualifies.
+        insider_buys_min: 1
+        insider_value_min: 100_000
+        lookback_days: 30
+        max_results: 50
+      prompt: |
+        Recent insider buying mentioned in news. Insider-following
+        candidates. Quality of insider (CEO, CFO) matters more than
+        quantity.
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 2. high_iv — names where options are richly priced
+    # ─────────────────────────────────────────────────────────────────────
+    # Why:  When IV is elevated, option premiums are fat. We sell
+    #       premium (iron condors, credit spreads) and collect the
+    #       decay. The opposite of "buy the dip" — we want jumpy names.
+    # Like:  Selling umbrellas when the forecast says rain every day.
+    # Note:  Requires IV rank to be available (paid tier). On the
+    #        Alpaca free tier this filter produces 0 results — that's
+    #        expected. Combine with options_liquid so the pipeline
+    #        still produces trades on free tier.
+    - name: high_iv
+      enabled: true
+      priority: 2
+      cycle_minutes: 15
+      type: options
+      criteria:
+        # Relaxed from 60 → 40 — more names have IV rank > 40 than > 60
+        iv_rank_min: 40
+        max_results: 50
+      prompt: |
+        High implied volatility rank. Recommend candidates for
+        premium-selling strategies (iron condors, credit spreads,
+        short straddles/strangles). Prefer names with a flat or
+        range-bound recent price action.
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 3. options_liquid — names with a liquid, tradeable options chain
+    # ─────────────────────────────────────────────────────────────────────
+    # Why:  The baseline filter. Liquidity = tight bid/ask and
+    #       meaningful open interest. Without this every other
+    #       strategy gets eaten alive by spreads.
+    # Like:  Picking the busy checkout lane at the grocery store.
+    - name: options_liquid
+      enabled: true
+      priority: 3
+      cycle_minutes: 5
+      type: options
+      criteria:
+        has_options: true
+        # Relaxed from $5M / OI 100 / spread 10% → $1M / OI 50 / spread 20%
+        # so mid-cap and lightly-traded names also qualify.
+        avg_dollar_volume_min: 1_000_000
+        min_open_interest: 50
+        max_bid_ask_spread_pct: 0.20
+        max_results: 50
+      prompt: |
+        Liquid options chains: tight bid/ask (under 20%), meaningful
+        open interest (50+). Recommend the best candidates for
+        options strategies. Prefer names with tight bid-ask and
+        high open interest at the strikes we'd actually trade.
+
+# -----------------------------------------------------------------------------
+# Scheduler (long-running workflow that fans out per-ticker workflows)
+# -----------------------------------------------------------------------------
+scheduler:
+  enabled: true
+  cycle_minutes: 5 # 5 min between reconciliation passes
+  cycle_interval_seconds: 300 # legacy alias for cycle_minutes
+  batch_size: 10 # tickers per launch batch
+  batch_gap_seconds: 30 # pause between batches
+  within_batch_gap_ms: 200 # stagger within a batch
+
+# -----------------------------------------------------------------------------
+# Debate (bull / bear loop + research manager gate)
+# -----------------------------------------------------------------------------
+debate:
+  # 1 bull + 1 bear call before research manager. The parent
+  # SchedulerWorkflow fires every 5 minutes, so each cycle is a
+  # fresh look at the ticker — round-2 carry-over rarely matters and
+  # 2 rounds = 4 LLM calls per ticker for a marginal verdict
+  # improvement. Cutting to 1 round (3 LLM calls) saves ~1 min per
+  # ticker in the debate phase.
+  rounds: 1
+  fast_no_trade_avg_confidence: 20 # if avg analyst confidence is below this, skip debate
+
+# -----------------------------------------------------------------------------
+# Macro series (pulled from FRED by MacroAnalyst)
+# -----------------------------------------------------------------------------
+macro:
+  series:
+    - DGS10 # 10y treasury
+    - DGS2 # 2y treasury
+    - VIXCLS # VIX
+    - T10Y2Y # 10y-2y spread
+  lookback_days: 90
+
+# -----------------------------------------------------------------------------
+# Agents — prompts keyed by agent_key (derived from Ruby class name).
+# agent_key rules: drop the "Agent" suffix, swap "::" for "_", snake_case
+#   Analyst::MarketDataAnalyst   -> analyst_market_data
+#   Debate::BullResearcher       -> debate_bull_researcher
+#   Trader                       -> trader
+#   Position::PositionReviewAgent-> position_position_review
+# -----------------------------------------------------------------------------
+agents:
+  analyst_market_data:
+    prompt: |
+      You are a market data analyst for an options trading system. You will
+      be given a ticker and a JSON payload with current market context.
+      Use the available MCP tools (get_stock_bars, get_option_chain,
+      get_option_snapshot) to gather the data. Return strict JSON:
+        {
+          "thesis":  "1-3 sentence summary of the setup",
+          "signals": ["iv_rank 78", "30d realized vol 22%", ...],
+          "confidence": 0-100
+        }
+  analyst_news:
+    prompt: |
+      You are a news analyst. Use the get_news MCP tool to pull recent
+      headlines for the ticker. Return strict JSON:
+        {
+          "thesis":  "1-3 sentence summary",
+          "signals": ["earnings in 2 days", "guidance cut", ...],
+          "confidence": 0-100
+        }
+  analyst_macro:
+    prompt: |
+      You are a macro analyst. The input payload already contains the
+      latest values of VIX, 10y, 2y, and 10y-2y spread. Assess the regime
+      and how it impacts options selling for this ticker. Return strict JSON:
+        {
+          "thesis":  "1-3 sentence summary",
+          "signals": ["vix 22", "10y 4.5%", ...],
+          "confidence": 0-100
+        }
+  analyst_insider:
+    prompt: |
+      You are an insider activity analyst. The input payload contains the
+      most recent Form 4 filings (already pulled from EDGAR). Identify
+      cluster buying/selling, weight by insider quality (CEO/CFO > director),
+      and return strict JSON:
+        {
+          "thesis":  "1-3 sentence summary",
+          "signals": ["CEO bought 50k @ 180", ...],
+          "confidence": 0-100
+        }
+  debate_bull_researcher:
+    prompt: |
+      You are the bull researcher. Given the analyst briefs and the prior
+      transcript of bull/bear arguments, build the strongest long case.
+      Address the bear's last argument directly. Return strict JSON:
+        {
+          "side": "bull",
+          "argument": "3-5 sentence case",
+          "cited_signals": ["iv_rank 78", ...],
+          "conviction": 0-100
+        }
+  debate_bear_researcher:
+    prompt: |
+      You are the bear researcher. Given the analyst briefs and the prior
+      transcript, build the strongest short/no-trade case. Address the
+      bull's last argument directly. Return strict JSON:
+        {
+          "side": "bear",
+          "argument": "3-5 sentence case",
+          "cited_signals": ["earnings risk", ...],
+          "conviction": 0-100
+        }
+  debate_research_manager:
+    prompt: |
+      You are the research manager. Read the full debate transcript and
+      the analyst briefs. Decide whether to recommend a trade. Return
+      strict JSON:
+        {
+          "verdict": "trade" | "no_trade",
+          "thesis": "1-2 sentence synthesis",
+          "trade_plan": null | {
+            "strategy": "iron_condor" | "vertical" | "straddle" | "strangle" | "calendar" | "hold",
+            "direction": "bullish" | "bearish" | "neutral",
+            "rationale": "..."
+          },
+          "confidence": 0-100,
+          "no_trade_reasons": []
+        }
+
+      MACRO INPUTS ARE SOFT, NOT HARD GATES. The macro analyst often
+      returns null for VIX / DGS10 / DGS2 / T10Y2Y when the FRED feed
+      is stale. Do NOT auto-reject on missing macro. Instead:
+        - If the bull/bear cases both reference specific ticker-level
+          signals (IV, options chain quality, momentum, news, options
+          flow) and disagree, weight those signals MORE heavily to
+          compensate for missing macro context.
+        - If both cases AND macro are missing, recommend no_trade with
+          `no_trade_reasons: ["insufficient_data"]` — the trader
+          can't design a thesis without any input.
+        - If the cases disagree but the disagreement is explainable
+          without macro (e.g. one says "rich IV, take premium" and
+          the other says "earnings risk"), pick the higher-conviction
+          side and call it `trade` with `confidence: 35-45` and
+          `no_trade_reasons: ["insufficient_macro"]` so the trader
+          proceeds with a smaller, more cautious sizing.
+      The downstream risk gate and position sizer (which uses the
+      live `options_buying_power` and max_notional cap) are the
+      REAL protection — they will keep a low-confidence trade small
+      and stop a bad one. The research gate's job is to identify
+      whether the bull/bear debate produced a directional view, NOT
+      to perfectly validate the macro regime.
+  trader:
+    prompt: |
+      You are the trader. Given a research plan with a directional view,
+      design a single concrete options order.
+
+      QTY IS PART OF YOUR PREDICTION. There is no default qty and no
+      minimum-size knob — you are the source of truth for position
+      sizing. The order you propose is what gets sent to the broker,
+      so make your qty recommendation intentionally:
+        - Bigger qty when conviction is high AND the strike is cheap
+          enough that the dollar exposure fits the budget.
+        - Smaller qty when conviction is moderate, or when the strike
+          is rich and 1 contract already consumes most of the budget.
+        - qty: 1 is a perfectly fine answer; pick it when in doubt.
+
+      ─── SIZING FROM THE LIVE ACCOUNT ───
+      The user_payload now includes a live `account` snapshot:
+        - account.cash                  → uninvested dollars
+        - account.equity                → total account value
+        - account.options_buying_power  → max dollar exposure for ONE options order
+      Your HARD DOLLAR CAP per trade is `options_buying_power`. The
+      `risk_limits.max_notional_per_trade` is a SECONDARY floor
+      (currently 10K) that overrides buying_power only if the account
+      has grown past it. Whichever is SMALLER is your real cap.
+      Goal: USE the full buying power. If the account has $10K, the
+      system should put the $10K to work. If the account has $1M,
+      a single trade can use up to the configured cap. Do NOT leave
+      the account idle "to be safe" — that's a guaranteed loss
+      against inflation and the broker's idle cash drag.
+
+      A proposal of `qty * limit_price` above the cap will be
+      REJECTED. Stay under it. Size your qty as
+      `floor(options_buying_power / limit_price)`, then adjust
+      down based on conviction (full size for high conviction,
+      half size for medium, quarter for speculative).
+
+      The user_payload also includes the current spot price so you can
+      reason about the strike you're choosing in dollars.
+
+      Return strict JSON. The proposal can be either a single-leg
+      order (one option) or a multi-leg spread (2-4 options, e.g.
+      bull call vertical, iron condor, calendar). On a paper account
+      with `options_approved_level <= 3`, you MUST emit multi-leg
+      spreads (NOT single-leg `sell_to_open`) — naked short single-
+      leg orders are rejected by both our safety net and the broker.
+
+      For a single-leg long (most common, allowed at all levels):
+        {
+          "proposal": {
+            "legs": [
+              {
+                "symbol":  "OCC option symbol, e.g. SPY260116C00580000",
+                "side":    "buy_to_open" | "buy_to_close" | "sell_to_close",
+                "qty":     <integer contracts, your call based on conviction and budget — default to floor(options_buying_power / limit_price)>,
+                "limit_price": <mid price or slightly inside the bid/ask>
+              }
+            ],
+            "tif":     "day",
+            "rationale": "1-2 sentence explanation, including WHY you sized at this qty (e.g. 'low conviction 1-lot probe', 'high conviction 3-lot sized to $X of $Y budget')"
+          }
+        }
+
+      For a multi-leg spread (REQUIRED for any `sell_to_open` at
+      levels 0-3 — naked shorts are blocked). Use the SAME qty on
+      every leg. Limit price is the NET debit (positive) or credit
+      (negative) for the whole order, e.g. -1.45 for a $1.45 credit:
+        {
+          "proposal": {
+            "legs": [
+              { "symbol": "SPY260116C00580000", "side": "buy_to_open",  "qty": 1, "limit_price": 5.20 },
+              { "symbol": "SPY260116C00600000", "side": "sell_to_open", "qty": 1, "limit_price": 3.75 }
+            ],
+            "tif": "day",
+            "rationale": "Bull call vertical: long 580C / short 600C, ~$1.45 debit, capturing directional momentum with defined risk."
+          }
+        }
+
+      Examples of common spread shapes:
+        - Bull call vertical: long lower-strike call (buy_to_open) + short higher-strike call (sell_to_open)
+        - Bear put vertical:   long higher-strike put (buy_to_open) + short lower-strike put (sell_to_open)
+        - Iron condor:        short put spread (buy lower, sell higher) + short call spread (sell lower, buy higher) — 4 legs
+        - Calendar:           long back-month option (buy_to_open) + short front-month same strike (sell_to_open)
+
+      For spreads, ALL legs must use the same `qty`. Net limit_price
+      convention: positive = debit (you pay), negative = credit
+      (you receive). The broker treats the order as one atomic
+      execution; if any leg fails to fill within the net limit, the
+      whole order cancels.
+  positions_position_review:
+    prompt: |
+      You are the position review agent. Given an open position and the
+      current market state, decide whether to hold, close, roll, adjust,
+      or add. Return strict JSON:
+        {
+          "action": "hold" | "close" | "roll" | "adjust" | "add",
+          "reason": "1-2 sentence explanation",
+          "details": {}
+        }
+  positions_adjustment:
+    prompt: |
+      You are the adjustment agent. Given an open position and a directive
+      (close, roll, adjust, add), propose the specific new order needed.
+      Return strict JSON:
+        {
+          "action": "close" | "roll" | "adjust" | "add",
+          "reason": "1-2 sentence explanation",
+          "details": {
+            "symbol":  "OCC option symbol",
+            "side":    "...",
+            "qty":     1,
+            "limit_price": 1.25
+          }
+        }
+  ticker_selector_agent:
+    prompt: |
+      You are the ticker selector for an options trading system.
+
+      Your job: given a list of candidate tickers that have already passed
+      the deterministic filters (each carries a `source_filter` and a
+      `scores` hash of per-criterion metrics), rank the top N and explain
+      your reasoning.
+
+      Prefer liquid names with clean options chains (high OI, tight bid/ask,
+      tight ATM spread). Avoid names with upcoming binary events (FDA, earnings
+      within 1 day) where the move is already priced in.
+
+      For each pick, return:
+        - ticker:        string
+        - confidence:    0-100
+        - source_filter: which filter caught it (from the candidate)
+        - rationale:     one terse phrase (under 12 words). The operator
+                         uses this for audit only — keep it scannable.
+                         Output tokens are the dominant cost of this
+                         call, so brevity directly cuts wall time.
+
+      Output strict JSON. The top-level may be either a bare array of pick
+      objects, or an object with a "picks" array — either is fine.
+
+      Example:
+        [
+          { "ticker": "SPY",   "confidence": 82, "source_filter": "high_iv_premium_sellers", "rationale": "high IV, tight ATM, liquid chain" },
+          { "ticker": "QQQ",   "confidence": 76, "source_filter": "momentum_7d",            "rationale": "strong 7d momentum, deep OI" }
+        ]
+
+# -----------------------------------------------------------------------------
+# Deterministic risk limits (RiskManager)
+# -----------------------------------------------------------------------------
+risk_limits:
+  max_open_positions: 500
+  max_position_pct: 0.20 # max % of equity in any single position (10% lets up to 10 positions fit the account)
+  max_daily_loss_pct: 0.50 # effectively disabled; tune down to 0.05 for a real daily stop
+  max_notional_per_trade: 100000 # secondary floor; the live options_buying_power is the real per-trade cap. Raised from $2K to $100K so Mid-Band Movers can deploy 35% of $1M BP across 6 tickers (~$58K each) with headroom.
+  # Cap on contracts per single order. Without this, the strategy
+  # sends qty=170+ on a single 0DTE name (cash÷premium) but the
+  # broker silently fills 1-2 contracts because the per-symbol
+  # position limit and partial-fill behavior on illiquid tickers
+  # makes large orders slip. 25 is large enough for liquid names
+  # (SPY/QQQ/IWM) to fill near-target while still small enough to
+  # prevent 1-2 contract fills on illiquid tickers.
+  max_qty_per_order: 500
+  max_daily_loss: 100000 # hard daily stop in dollars (bumped from $50K for overnight_reversal total_risk_pct=0.80)
+  max_total_delta: 100
+  max_total_vega: 50000
+  max_total_theta: -500
+  decision_ttl_seconds: 120 # PortfolioManager rejects risk decisions older than this
+
+# -----------------------------------------------------------------------------
+# Position management — PositionMonitor (deterministic, 1-min loop)
+# -----------------------------------------------------------------------------
+position_monitor:
+  frequency_minutes: 1
+  interval_seconds: 60 # MonitorPositionWorkflow loop period
+  hard_exits:
+    stop_loss_pct: 0.50
+    profit_target_pct: 0.10
+    dte_close_threshold: 1
+
+# -----------------------------------------------------------------------------
+# Position review soft triggers
+# -----------------------------------------------------------------------------
+position_review:
+  frequency_minutes: 30
+  interval_seconds: 1800 # ReviewPositionWorkflow loop period
+  exit_after_hold_cycles: 4 # after N consecutive "hold" verdicts, exit the workflow
+  force_re_eval_after_hours: 8
+  soft_triggers:
+    iv_change_pct_threshold: 30
+    unrealized_pnl_pct_threshold: 40
+    time_decay_consumed_pct_threshold: 75
+
+# -----------------------------------------------------------------------------
+# Mid-Band Movers strategy — non-LLM, deterministic. Picks the middle
+# band of today's top movers, splits them into 3 buckets by hold-time
+# (2h / 5h / 23.5h), and buys ATM 30-DTE long calls sized off
+# options_buying_power × 35%.
+#
+# Schedule: 11:30 AM ET Mon-Fri (2h after market open). The Temporal
+# schedule fires RunMidBandMoversWorkflow which spawns child
+# SellWorkflows for each submitted order; the children sleep until
+# planned_sell_at and then submit market sell_to_close orders.
+#
+# Positions created by this strategy have `origin: 'mid_band_movers'`,
+# which the LLM review path skips — the review-all schedule
+# (position-review-all) checks `origin == 'default'` before re-evaluating
+# a position, so strategy-managed positions are not double-closed.
+# -----------------------------------------------------------------------------
+mid_band_movers:
+  enabled: true
+  # Top-N movers to consider from get_market_movers. The MCP
+  # server's top-of-day-gainers feed is heavily skewed toward
+  # micro-caps / warrants / OTC names that aren't in the
+  # optionable universe — pulling just 50 names typically yields
+  # 2-5 optionable survivors. We pull 100 (gainers + losers)
+  # and let the universe filter + top-off handle the rest. Going
+  # higher (e.g. 200) makes the MCP call slow enough to risk
+  # timing out the 180s activity deadline.
+  movers_top_n: 100
+  # Soft cap on the optionable universe fed into the planning step.
+  # The full list is ~6,300 names; we use a high cap so the
+  # filter has the full set to match against. The cached full set
+  # is still available for any caller that needs the whole
+  # universe.
+  universe_top_n: 10000
+  # Minimum number of optionable names the strategy needs after
+  # the universe filter. If the live movers feed leaves us below
+  # this, the activity tops off with a deterministic sample from
+  # the universe itself (percent_change=0 so they land in the
+  # middle band rather than being dropped top/bottom).
+  min_kept_after_filter: 20
+  # Middle-band filter: drop the top X% (biggest gainers) and
+  # bottom Y% (smallest movers), keep the rest. With 50 movers,
+  # drop_top_pct=20 + drop_bottom_pct=50 → 15 tickers.
+  middle_band:
+    drop_top_pct: 5
+    drop_bottom_pct: 60
+  # 3 buckets. weights must sum to 100. Each bucket gets its
+  # share of the total budget, split equally across the tickers
+  # in that bucket. `hold_hours` = how long until SellWorkflow
+  # fires for that bucket.
+  #   A: 2h hold  → sell at 1:30 PM ET
+  #   B: 4h hold  → sell at 3:30 PM ET
+  #   C: 23.5h    → sell next day at 11:00 AM ET
+  buckets:
+    - { name: "A", weight_pct: 30, hold_hours: 2 }
+    - { name: "B", weight_pct: 30, hold_hours: 4 }
+    - { name: "C", weight_pct: 40, hold_hours: 23.5 }
+  # Total risk budget = options_buying_power × total_risk_pct.
+  # Then split by bucket weight, then per-ticker.
+  total_risk_pct: 0.20
+  # ATM call, 30 days to expiration (target).
+  dte_target: 30
+  # If the filtered movers list is empty, fall back to a random
+  # sample of the optionable universe. Set to 0 to disable (and
+  # skip the day if the filter finds nothing).
+  fallback_random_count: 50
+  # Submission retry caps. The activity catches and logs failures
+  # but does not retry internally — the parent workflow is the
+  # retry mechanism (it can be re-fired manually via Temporal UI).
+  max_buy_attempts: 3
+  max_sell_attempts: 2
+
+# -----------------------------------------------------------------------------
+# Overnight Reversal strategy — pure deterministic, no LLM. Trades
+# the *prior session's* extremes into the current session:
+#   • Yesterday's biggest WINNERS  → buy ATM 0DTE calls     (long bias)
+#   • Yesterday's biggest LOSERS   → sell bear call credit spreads (short bias)
+# Both legs close at 15:55 ET via ClosePositionsActivity. Positions
+# use origin: 'overnight_reversal' (LLM review skips them).
+#
+# Schedule: 9:35 AM ET Mon-Fri (5 min after open, so yesterday's daily
+# settle has propagated through the TradingView screens). Skips if
+# yesterday was a half-day or today is a market holiday (no orders,
+# no child close — empty plan is reported by the workflow).
+#
+# Risk budget: total_risk_pct × options_buying_power, split 50/50
+# between winners and losers bucket, then per-name inside the bucket.
+# With total_risk_pct=0.80 on $66K BP = $52.8K total risk deployed.
+# Spread width is fixed at $5.00 below — max loss per spread
+# contract = $5 × 100 = $500; sized so the per-name max-loss is
+# bounded by `loss_per_name_max` (default $2.7K).
+# -----------------------------------------------------------------------------
+overnight_reversal:
+  enabled: true
+  # Counts — number of winners and losers to trade each session.
+  winners_count: 20
+  losers_count: 20
+  # How many extra candidates per bucket to probe beyond
+  # winners_count/losers_count. At runtime we probe the top
+  # (winners_count × probe_pool_multiplier) names per bucket and
+  # pick the first `winners_count` whose 0DTE/3DTE/7DTE chain
+  # exists. Multiplier × 3 gives us 15 candidates per side at the
+  # default 5 — enough to absorb ~67% ineligibility without
+  # shorting the bucket. Tune down if MCP rate limits bite.
+  probe_pool_multiplier: 10
+  # Per-exchange cap on the TradingView screener call. Each symbol
+  # enriched with full technical indicators takes ~0.5-1s. limit=20
+  # per exchange × 2 exchanges × 2 tools (gainers + losers) ≈ 4
+  # remote calls, ~30-45 s total — well under the activity's 300 s
+  # timeout. Combined with the universe + spot filters in the planner,
+  # we get a usable candidate pool even at this size.
+  tv_top_n_per_exchange: 20
+  # Total risk budget as fraction of options_buying_power.
+  total_risk_pct: 1.0
+  # 50/50 split between winners (long calls) and losers (credit spreads).
+  winner_bucket_weight: 0.50
+  loser_bucket_weight: 0.50
+  # ---- option structure ----
+  # dte_target: list of acceptable days-to-expiry values to probe.
+  # The planner checks each surviving ticker against every DTE in
+  # the list and picks the first one with a usable chain. Example:
+  #   dte_target: [0, 1, 3, 7, 14, 30, 60]   # 0DTE through 2-month
+  #   dte_target: [0, 3, 7]            # 0DTE + weeklies
+  #   dte_target: 0                    # only 0DTE
+  # The order activity uses the chosen DTE per name to pick a real
+  # strike + premium at submit time. Close at 15:55 ET the same
+  # day regardless of DTE — we never carry positions overnight.
+  # 0DTE / 1DTE / 3DTE are tried first (best premium for same-day
+  # fade); 7-60 DTE only fire for true micro-caps where the broker
+  # has no 0DTE listing.
+  dte_target: [0, 3, 7, 14, 30, 60]
+  # Whether to skip days where the underlying market is closed
+  # (won't fire for half-days per the existing half_day? check).
+  skip_market_closed_dtes: true
+  # Winners: ATM 0DTE long call (single-leg, buy_to_open).
+  winner_strike_selection: atm # 'atm' or 'atm-1' (1 strike ITM)
+  # Losers: bear call credit spread (mleg, sell_to_open short + buy_to_open long).
+  # Short strike targets ~delta 0.20 (1-2 strikes OTM); width is fixed
+  # in dollars. Long strike = short strike + spread_width.
+  short_delta_target: 0.20
+  spread_width: 5.0
+  # Skip a name if credit < width × this fraction (degenerate spreads).
+  # Default 0.01 = accept any positive credit. Raise to 0.05+ for
+  # higher-quality fills at the cost of fewer orders.
+  min_credit_to_width: 0.01
+  # Always-on base underlyings that are appended to the screener
+  # output regardless of %change ranking. These are mega-caps
+  # with deep 0DTE/3DTE/7DTE option chains — they fill the bucket
+  # even on days when the screener is dominated by illiquid names.
+  # Each entry gets 1 winner slot + 1 loser slot (2 per symbol).
+  # 10 entries → 20 guaranteed slots, fully populating both buckets
+  # without depending on the screener returning liquid names.
+  base_underlyings:
+    - SPY # SPDR S&P 500 ETF — most liquid 0DTE chain on the market
+    - QQQ # Invesco QQQ Trust — heavy 0DTE volume
+    - IWM # iShares Russell 2000 — has 0DTE weeklys
+    - DIA # SPDR Dow Jones — 0DTE weeklys
+    - NVDA # NVIDIA — deep options liquidity on every DTE
+    - TSLA # Tesla — heavy 0DTE volume, tight spreads
+    - AAPL # Apple — liquid 0DTE through 60DTE
+    - MSFT # Microsoft — deep book, low bid/ask
+    - AMD  # Advanced Micro Devices — heavy options volume
+    - META # Meta Platforms — liquid 0DTE weeklys
+  # ---- universe filters ----
+  # Eligibility is decided entirely by the runtime probe at plan
+  # time: a name is tradeable iff the broker returns a chain at
+  # one of the `dte_target` values. No price/exchange floor here
+  # so any name the broker quotes is fair game.
+  min_underlying_price: 0 # no-op floor; the probe decides
+  # Liquidity floor: drop movers whose latest daily volume is below
+  # this. Filters out the long tail of low-cap pumps the screener
+  # surfaces. 0 disables the filter.
+  min_daily_volume: 100_000
+  # Probe liquidity floor: the broker's `as` field on the chain is
+  # how many contracts it will fill at the ask price. Names with
+  # only 1-2 contracts at the picked strike still fill — the order
+  # just lands at qty=1 instead of getting entirely dropped. We
+  # default to 1 (most permissive) so 0DTE chains still probe-pass
+  # even when the broker has only a handful of contracts. Raise to
+  # 5+ if you see partial fills of 1 contract hurting your average
+  # deployment size.
+  probe_min_ask_size: 1
+  # ---- screening source ----
+  # 'tradingview' uses top_gainers/top_losers MCP tools (default).
+  # 'alpaca_bars' pulls 2-day bars for the full optionable universe
+  # and computes yesterday's daily %change.
+  # screen_source: "tradingview"
+  screen_source: "alpaca_bars"
+  # ---- close timing ----
+  close_at_et: "15:55" # HH:MM in America/New_York
+  # ---- skip days ----
+  # Skip if yesterday was a half-day (early close before a holiday).
+  skip_half_days: true
+  # Caps
+  max_buy_attempts: 3
+  max_close_attempts: 2
+
+# -----------------------------------------------------------------------------
+# Rate limiter (per source) — LEGACY shape used by 00_rate_limiter.rb.
+# Kept for backward compatibility. New code prefers `rate_limiters:`
+# below; the initializer accepts both shapes.
+# -----------------------------------------------------------------------------
+rate_limits:
+  alpaca_mcp: { limit: 180, window: 60 }
+  # TradingView MCP is free + public; their endpoints tolerate burst
+  # traffic but the upstream we wrap rate-limits unauthenticated callers
+  # aggressively. 30/min is well within the published limit and still
+  # fast enough for one screen per 5 minutes.
+  tradingview_mcp: { limit: 30, window: 60 }
+  optionsflow_mcp: { limit: 30, window: 60 }
+  fred: { limit: 60, window: 60 }
+  edgar: { limit: 8, window: 1 }
+  # Bumped the LLM cap to 90/60s — 4 analysts in parallel × 11 tickers
+  # per cycle is 44 calls in a burst, and the previous 50/60s made
+  # half of them queue behind a 30s acquire_timeout. 90/60s gives
+  # every analyst a token in the first 30s window.
+  llm: { limit: 90, window: 60 }
+
+# -----------------------------------------------------------------------------
+# Rate limiters — NEW shape (`rate_per_minute` per source). The
+# initializer accepts BOTH the legacy `limit/window` shape above and
+# this `rate_per_minute` shape. If both are set for the same source,
+# the new one wins.
+# -----------------------------------------------------------------------------
+rate_limiters:
+  llm: { rate_per_minute: 240 }
+  edgar: { rate_per_minute: 10 }
+  fred: { rate_per_minute: 5 }
+  alpaca_mcp: { rate_per_minute: 120 }
+  tradingview_mcp: { rate_per_minute: 30 }
+  optionsflow_mcp: { rate_per_minute: 30 }
+
+# -----------------------------------------------------------------------------
+# Circuit breaker — LEGACY single-config shape. Kept for backward
+# compatibility. New code prefers the per-source `circuit_breakers:`
+# block below.
+# -----------------------------------------------------------------------------
+circuit_breaker:
+  failure_threshold: 3
+  reset_timeout_seconds: 60
+  reset_backoff_after_cycles: 5
+  reset_backoff_to_seconds: 300
+
+# -----------------------------------------------------------------------------
+# Circuit breakers — per-source thresholds. Falls back to the legacy
+# `circuit_breaker:` block when a source isn't listed here. The
+# initializer reads whichever is set; the per-source values win
+# when both are present.
+# -----------------------------------------------------------------------------
+circuit_breakers:
+  fred:
+    failure_threshold: 3
+    reset_timeout_seconds: 60
+  edgar:
+    failure_threshold: 5
+    reset_timeout_seconds: 120
+  alpaca_mcp:
+    failure_threshold: 5
+    reset_timeout_seconds: 30
+  llm:
+    # Tuned for a paid MiniMax account. The default 10/30s was
+    # too tight: 11 tickers × 7 LLM calls per cycle = 77 calls in
+    # a ~30s burst tripped the circuit on the first transient
+    # 429 from the upstream provider. 240/min = 4/sec is generous
+    # for a 5-min cycle, and the longer reset window prevents the
+    # circuit from thrashing open/closed every 30s. If you see the
+    # circuit open during a cycle, lower `rate_limiters.llm.rate_per_minute`
+    # or shrink the scheduler batch size.
+    failure_threshold: 25
+    reset_timeout_seconds: 90
+  tradingview_mcp:
+    failure_threshold: 3
+    reset_timeout_seconds: 60
+  optionsflow_mcp:
+    failure_threshold: 3
+    reset_timeout_seconds: 60
+
+# -----------------------------------------------------------------------------
+# EDGAR client (SEC Form 4 insider data)
+# -----------------------------------------------------------------------------
+edgar:
+  user_agent: "TraderApp/1.0 (contact: trading-eng@example.com)"
+  base_url: https://www.sec.gov
+  rate_limit_per_minute: 10
+  request_timeout_seconds: 30
+
+# -----------------------------------------------------------------------------
+# FRED client (macro series: DGS10, DGS2, VIXCLS, T10Y2Y)
+# -----------------------------------------------------------------------------
+fred:
+  base_url: https://api.stlouisfed.org
+  rate_limit_per_minute: 5
+  circuit_breaker_threshold: 3
+
+# -----------------------------------------------------------------------------
+# Backtest
+# -----------------------------------------------------------------------------
+backtest:
+  enabled: true
+  default_period_days: 90
+  default_tickers: []
+  data_source: alpaca
+  slippage_pct: 0.5
+  commission_per_contract: 0.65
+  fill_model: mid
+  start_of_day_equity: 100000
+
+# -----------------------------------------------------------------------------
+# Alpaca MCP client
+# -----------------------------------------------------------------------------
+alpaca_mcp:
+  url: <%= ENV["ALPACA_MCP_URL"] || "http://alpaca-mcp:8000/mcp" %>
+  toolset_server: "account,trading,stock-data,options-data,news,assets"
+  # Toolsets the LLM-backed agents are allowed to call. The full MCP
+  # server exposes everything; we filter client-side so the agents
+  # can never place orders or move money.
+  readonly_toolsets: [account, stock-data, options-data, news, assets]
+  # Toolsets reserved for the deterministic PortfolioManager only —
+  # not visible to LLM agents.
+  trading_toolsets: [trading, positions]
+
+# -----------------------------------------------------------------------------
+# MCP servers — the api process can connect to any of these for LLM
+# agents to call. `enabled:` is a string that expands to true/false
+# based on whether the env var is set; missing keys disable the
+# server gracefully so the rest of the pipeline still works.
+# -----------------------------------------------------------------------------
+# MCP servers — only the three core data sources for the trading
+# pipeline (alpaca for orders/market data, tradingview for screening,
+# optionsflow for sentiment). Other integrations (twitter, bluesky,
+# massive/polygon, stock-market) are out of scope for now.
+mcp:
+  servers:
+    - name: alpaca
+      url: http://alpaca-mcp:8000/mcp
+      enabled: true
+    - name: tradingview
+      url: http://tradingview-mcp:8001/mcp
+      enabled: true
+    - name: optionsflow
+      url: http://optionsflow-mcp:8003/mcp
+      enabled: true
+    - name: fred
+      url: https://api.stlouisfed.org/fred
+      enabled: true
+      env:
+        FRED_API_KEY: ${FRED_API_KEY}
